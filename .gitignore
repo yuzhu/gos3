@@ -1,0 +1,30 @@
+# Binary and object files
+bin/
+obj/
+gos3
+/tmp/
+
+# Tools/IDEs
+.vscode/
+.idea/
+.DS_Store
+
+# Go specific
+vendor/
+go.sum
+*.test
+*.prof
+
+# Test artifacts
+output.bin
+test-key
+flaky-file
+bad-file
+bad-checksum
+slow-file
+checksum-file
+large-file
+large-redirected
+redirected-file
+section-test
+bench
