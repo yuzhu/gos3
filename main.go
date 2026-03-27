@@ -67,12 +67,33 @@ func main() {
 	flag.Parse()
 	cfg.ChunkSize = *chunkSizeMB * 1024 * 1024
 
-	// Resolve AWS credentials: CLI flags > env vars > credentials file
+	// Resolve AWS credentials with clear priority:
+	//   1. Explicit CLI flags (--access-key, --secret-key)
+	//   2. Explicit --profile from ~/.aws/credentials
+	//   3. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+	//   4. Default profile from ~/.aws/credentials
 	if cfg.AccessKey == "" || cfg.SecretKey == "" {
-		creds, err := downloader.LoadAWSCredentials(profile)
-		if err != nil {
-			log.Printf("[warn] could not load AWS credentials: %v", err)
-		} else if creds != nil {
+		var creds *downloader.AWSCredentials
+		var err error
+
+		if profile != "" {
+			// User explicitly requested a profile — use it
+			creds, err = downloader.LoadAWSCredentialsFromProfile(profile)
+			if err != nil {
+				log.Fatalf("could not load credentials for profile %q: %v", profile, err)
+			}
+		} else if envCreds := downloader.LoadAWSCredentialsFromEnv(); envCreds != nil {
+			// Fall back to environment variables
+			creds = envCreds
+		} else {
+			// Fall back to default profile
+			creds, err = downloader.LoadAWSCredentialsFromProfile("default")
+			if err != nil {
+				log.Printf("[warn] no credentials found (no --profile, no env vars, no default profile): %v", err)
+			}
+		}
+
+		if creds != nil {
 			if cfg.AccessKey == "" {
 				cfg.AccessKey = creds.AccessKeyID
 			}

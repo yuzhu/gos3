@@ -15,24 +15,27 @@ type AWSCredentials struct {
 	SessionToken    string // Optional, for temporary credentials
 }
 
-// LoadAWSCredentials reads credentials from ~/.aws/credentials for the given profile.
-// If profile is empty, it defaults to "default".
-// Falls back to environment variables if the file is not found or profile is missing.
-func LoadAWSCredentials(profile string) (*AWSCredentials, error) {
+// LoadAWSCredentialsFromEnv reads credentials from environment variables.
+// Returns nil if no credentials are found in the environment.
+func LoadAWSCredentialsFromEnv() *AWSCredentials {
+	ak := os.Getenv("AWS_ACCESS_KEY_ID")
+	sk := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if ak == "" || sk == "" {
+		return nil
+	}
+	return &AWSCredentials{
+		AccessKeyID:    ak,
+		SecretAccessKey: sk,
+		SessionToken:   os.Getenv("AWS_SESSION_TOKEN"),
+	}
+}
+
+// LoadAWSCredentialsFromProfile reads credentials from ~/.aws/credentials for the given profile.
+func LoadAWSCredentialsFromProfile(profile string) (*AWSCredentials, error) {
 	if profile == "" {
 		profile = "default"
 	}
 
-	// Try environment variables first (highest priority)
-	if ak := os.Getenv("AWS_ACCESS_KEY_ID"); ak != "" {
-		return &AWSCredentials{
-			AccessKeyID:    ak,
-			SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
-			SessionToken:   os.Getenv("AWS_SESSION_TOKEN"),
-		}, nil
-	}
-
-	// Try credentials file
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine home directory: %w", err)
