@@ -336,8 +336,12 @@ func TestBuildListURL(t *testing.T) {
 	if !strings.Contains(url, "list-type=2") {
 		t.Errorf("URL should contain list-type=2: %s", url)
 	}
-	if !strings.Contains(url, "prefix=data%2Fmodels%2F") {
-		t.Errorf("URL should contain encoded prefix: %s", url)
+	// Prefix must have literal slashes, NOT %2F — S3 treats %2F as a literal char
+	if !strings.Contains(url, "prefix=data/models/") {
+		t.Errorf("URL should contain prefix with literal slashes: %s", url)
+	}
+	if strings.Contains(url, "%2F") {
+		t.Errorf("URL must NOT contain %%2F (encoded slashes break S3 prefix matching): %s", url)
 	}
 
 	urlWithToken := buildListURL(cfg, "data/", "abc123")

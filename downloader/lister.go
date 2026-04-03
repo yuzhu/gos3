@@ -139,16 +139,28 @@ func listPage(ctx context.Context, client *http.Client, cfg *Config, prefix, con
 
 // buildListURL constructs the S3 ListObjectsV2 URL with query parameters.
 // Uses path-style: http://endpoint/bucket?list-type=2&prefix=xxx
+//
+// Note: We cannot use url.Values.Encode() for the prefix because it encodes
+// "/" to "%2F". S3 treats "%2F" as a literal character, not a path separator,
+// so a prefix of "a%2Fb%2F" matches nothing while "a/b/" matches correctly.
 func buildListURL(cfg *Config, prefix, continuationToken string) string {
 	params := url.Values{}
 	params.Set("list-type", "2")
 	params.Set("max-keys", "1000")
-	if prefix != "" {
-		params.Set("prefix", prefix)
-	}
 	if continuationToken != "" {
 		params.Set("continuation-token", continuationToken)
 	}
 
-	return fmt.Sprintf("%s/%s?%s", cfg.Endpoint, url.PathEscape(cfg.Bucket), params.Encode())
+	query := params.Encode()
+	if prefix != "" {
+		// Encode prefix carefully: encode each segment but preserve slashes
+		parts := strings.Split(prefix, "/")
+		for i, p := range parts {
+			parts[i] = url.QueryEscape(p)
+		}
+		query += "&prefix=" + strings.Join(parts, "/")
+	}
+
+	return fmt.Sprintf("%s/%s?%s", cfg.Endpoint, url.PathEscape(cfg.Bucket), query)
 }
+
