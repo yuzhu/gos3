@@ -116,4 +116,4 @@ Benchmark results for a ~829 MiB file in `us-east-1`:
 
 ## License
 
-BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.
+Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
