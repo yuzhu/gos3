@@ -5,6 +5,7 @@
 ## Features
 
 - **Parallel Chunked Downloads**: Downloads files in multiple parallel ranges for maximum throughput.
+- **Prefix-Based Multi-File Downloads**: Download all objects under an S3 prefix with two-level parallelism — multiple files download simultaneously, each with parallel chunked transfers.
 - **Zero-Copy I/O**: Efficiently handles data transfer to minimize memory consumption and GC pressure.
 - **AWS SigV4 Signing**: Built-in support for SigV4 with credential and region auto-detection.
 - **Automated Redirect Handling**: Correctly follows 307 temporary redirects while preserving range headers and re-signing requests.
@@ -13,6 +14,7 @@
   - **Exponential Backoff**: Automatic retries with jitter for transient errors.
   - **ETag Checksum Verification**: Post-download MD5 validation for object integrity.
   - **Atomic Writes**: Downloads to a temporary file and renames it only upon successful completion.
+  - **Skip Existing**: Resumes interrupted prefix downloads by skipping files that already match the expected size.
 - **Container Optimized**: Automatically detects cgroup CPU quotas and adjusts `GOMAXPROCS`.
 
 ## Installation
@@ -46,9 +48,28 @@ export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ./gos3 --bucket my-bucket --key my-object.tar --output local-file.tar
 ```
 
+### Download All Files Under a Prefix
+```bash
+./gos3 \
+  --endpoint https://s3.amazonaws.com \
+  --bucket my-bucket \
+  --prefix models/v2/ \
+  --output /tmp/models/ \
+  --file-concurrency 8
+```
+
+You can also use `--key` with a trailing slash — it's auto-detected as prefix mode:
+```bash
+./gos3 --bucket my-bucket --key models/v2/ --output /tmp/models/
+```
+
 ### Tuning for Performance
 ```bash
+# Single file: increase chunk parallelism
 ./gos3 --concurrency 32 --chunk-size-mb 128 --bucket my-bucket --key my-object.tar --output local-file.tar
+
+# Prefix mode: 8 files × 16 chunks = 128 parallel connections
+./gos3 --prefix data/ --output /tmp/data/ --file-concurrency 8 --concurrency 16 --bucket my-bucket
 ```
 
 ## Authentication Priority
@@ -66,17 +87,20 @@ Credentials are resolved in this order (highest to lowest):
 | :--- | :--- | :--- |
 | `--endpoint` | *(required)* | S3-compatible endpoint URL |
 | `--bucket` | *(required)* | S3 bucket name |
-| `--key` | *(required)* | S3 object key |
-| `--output` | *(required)* | Local output path |
+| `--key` | *(required)* | S3 object key (single file) or prefix with trailing `/` |
+| `--output` | *(required)* | Local file path (single) or directory (prefix mode) |
+| `--prefix` | | S3 key prefix — download all objects under it |
 | `--access-key` | | AWS access key ID |
 | `--secret-key` | | AWS secret access key |
 | `--profile` | | AWS credentials profile (`~/.aws/credentials`) |
 | `--region` | `us-east-1` | AWS region |
-| `--concurrency` | `16` | Number of parallel chunk downloads |
+| `--concurrency` | `16` | Parallel chunk downloads per file |
+| `--file-concurrency` | `4` | Files downloading simultaneously (prefix mode) |
 | `--chunk-size-mb` | `64` | Chunk size in MB |
 | `--max-retries` | `3` | Max retries per chunk on transient errors |
 | `--skip-checksum` | `false` | Skip ETag/MD5 checksum verification |
 | `--chunk-timeout` | `5m` | Per-chunk download timeout |
+| `--fail-fast` | `false` | Stop all downloads on first error (prefix mode) |
 | `--insecure` | `false` | Skip TLS certificate verification |
 | `--verbose` | `false` | Enable verbose logging |
 
