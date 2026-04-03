@@ -425,8 +425,13 @@ func downloadParallel(ctx context.Context, client *http.Client, cfg *Config, out
 			completed := completedChunks.Add(1)
 
 			if cfg.Verbose {
-				log.Printf("[progress] chunk %d/%d complete (%d bytes)",
-					completed, numChunks, n)
+				// Log at 25% milestones to avoid flooding output
+				pct := int(completed * 100 / int64(numChunks))
+				prevPct := int((completed - 1) * 100 / int64(numChunks))
+				if pct/25 > prevPct/25 || completed == int64(numChunks) {
+					log.Printf("[progress] %s: %d/%d chunks (%d%%)",
+						cfg.Key, completed, numChunks, pct)
+				}
 			}
 		}(c)
 	}

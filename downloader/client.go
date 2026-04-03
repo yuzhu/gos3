@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path"
+	"sync"
 	"time"
 )
 
@@ -69,39 +71,50 @@ func newHTTPClient(cfg *Config) *http.Client {
 		// 2. Preserve the original HTTP method (307 requires this per RFC)
 		// 3. Re-sign the request for the new host
 		// 4. Limit redirect depth to prevent loops
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= maxRedirects {
-				return fmt.Errorf("stopped after %d redirects", maxRedirects)
-			}
+		CheckRedirect: func() func(req *http.Request, via []*http.Request) error {
+			// Track which file paths we've already logged a redirect for.
+			// Without this, every chunk (32+) of every file produces a
+			// redirect log line, drowning the useful output.
+			var loggedRedirects sync.Map
 
-			if cfg.Verbose {
-				log.Printf("[redirect] %d %s → %s",
-					len(via), via[len(via)-1].URL.String(), req.URL.String())
-			}
-
-			// Copy essential headers from the original request.
-			// The redirect may go to a different host (Alluxio worker),
-			// so we need to re-apply our custom headers.
-			// Use the immediately-preceding request to handle multi-hop chains.
-			prev := via[len(via)-1]
-			for _, header := range []string{"Range"} {
-				if v := prev.Header.Get(header); v != "" {
-					req.Header.Set(header, v)
+			return func(req *http.Request, via []*http.Request) error {
+				if len(via) >= maxRedirects {
+					return fmt.Errorf("stopped after %d redirects", maxRedirects)
 				}
-			}
 
-			// Re-sign the request for the new endpoint.
-			// The Host changed due to redirect, so the original signature is invalid.
-			if cfg.AccessKey != "" && cfg.SecretKey != "" {
-				// Clear old auth headers before re-signing
-				req.Header.Del("Authorization")
-				req.Header.Del("X-Amz-Date")
-				req.Header.Del("X-Amz-Content-Sha256")
-				req.Header.Del("Host")
-				signRequest(req, cfg.AccessKey, cfg.SecretKey, cfg.Region, "s3")
-			}
+				if cfg.Verbose {
+					// Log only the first redirect per file (by base path)
+					filePath := path.Dir(req.URL.Path) + "/" + path.Base(req.URL.Path)
+					if _, loaded := loggedRedirects.LoadOrStore(filePath, true); !loaded {
+						log.Printf("[redirect] %s → %s",
+							via[len(via)-1].URL.Host, req.URL.Host)
+					}
+				}
 
-			return nil
-		},
+				// Copy essential headers from the original request.
+				// The redirect may go to a different host (Alluxio worker),
+				// so we need to re-apply our custom headers.
+				// Use the immediately-preceding request to handle multi-hop chains.
+				prev := via[len(via)-1]
+				for _, header := range []string{"Range"} {
+					if v := prev.Header.Get(header); v != "" {
+						req.Header.Set(header, v)
+					}
+				}
+
+				// Re-sign the request for the new endpoint.
+				// The Host changed due to redirect, so the original signature is invalid.
+				if cfg.AccessKey != "" && cfg.SecretKey != "" {
+					// Clear old auth headers before re-signing
+					req.Header.Del("Authorization")
+					req.Header.Del("X-Amz-Date")
+					req.Header.Del("X-Amz-Content-Sha256")
+					req.Header.Del("Host")
+					signRequest(req, cfg.AccessKey, cfg.SecretKey, cfg.Region, "s3")
+				}
+
+				return nil
+			}
+		}(),
 	}
 }
