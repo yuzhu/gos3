@@ -19,9 +19,6 @@ import (
 
 func main() {
 	// Set GOMAXPROCS based on container CPU quota if available.
-	// In Kubernetes pods with CPU limits, the Go runtime defaults to
-	// the host's NumCPU which can be far higher than the cgroup quota,
-	// causing excessive context switching and throttling.
 	setGOMAXPROCS()
 
 	cfg := downloader.DefaultConfig()
@@ -29,8 +26,8 @@ func main() {
 	// Required flags
 	flag.StringVar(&cfg.Endpoint, "endpoint", "", "S3-compatible endpoint URL (e.g., http://alluxio-proxy:29998)")
 	flag.StringVar(&cfg.Bucket, "bucket", "", "S3 bucket name")
-	flag.StringVar(&cfg.Key, "key", "", "S3 object key (path within bucket)")
-	flag.StringVar(&cfg.OutputPath, "output", "", "Local file path to write to")
+	flag.StringVar(&cfg.Key, "key", "", "S3 object key (single file) or prefix ending with / (multi-file)")
+	flag.StringVar(&cfg.OutputPath, "output", "", "Local file path (single) or directory (prefix mode)")
 
 	// Auth flags
 	var profile string
@@ -40,9 +37,17 @@ func main() {
 	flag.StringVar(&cfg.Region, "region", "", "AWS region (overrides profile/env, default: us-east-1)")
 
 	// Performance flags
-	flag.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "Number of parallel chunk downloads")
+	flag.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "Number of parallel chunk downloads per file")
 	chunkSizeMB := flag.Int64("chunk-size-mb", cfg.ChunkSize/(1024*1024), "Chunk size in MB for parallel downloads")
 	flag.DurationVar(&cfg.ChunkTimeout, "chunk-timeout", cfg.ChunkTimeout, "Timeout per chunk download")
+
+	// Multi-file flags
+	var prefix string
+	var fileConcurrency int
+	var failFast bool
+	flag.StringVar(&prefix, "prefix", "", "S3 key prefix to download all objects under (alternative to --key with trailing /)")
+	flag.IntVar(&fileConcurrency, "file-concurrency", 4, "Number of files to download simultaneously in prefix mode")
+	flag.BoolVar(&failFast, "fail-fast", false, "In prefix mode, stop all downloads on first error")
 
 	// Optional flags
 	flag.BoolVar(&cfg.InsecureTLS, "insecure", false, "Skip TLS certificate verification")
@@ -53,13 +58,15 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "gos3 - High-performance S3 downloader for Alluxio\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  gos3 --endpoint URL --bucket BUCKET --key KEY --output PATH\n\n")
+		fmt.Fprintf(os.Stderr, "  gos3 --endpoint URL --bucket BUCKET --key KEY --output PATH\n")
+		fmt.Fprintf(os.Stderr, "  gos3 --endpoint URL --bucket BUCKET --prefix PREFIX --output DIR\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
-		fmt.Fprintf(os.Stderr, "  # Download from Alluxio S3 proxy\n")
+		fmt.Fprintf(os.Stderr, "  # Download a single file\n")
 		fmt.Fprintf(os.Stderr, "  gos3 --endpoint http://alluxio-lb:29998 --bucket mydata --key models/large.bin --output /tmp/large.bin\n\n")
-		fmt.Fprintf(os.Stderr, "  # With auth and tuned parallelism\n")
-		fmt.Fprintf(os.Stderr, "  gos3 --endpoint http://alluxio-lb:29998 --bucket mydata --key models/large.bin --output /tmp/large.bin \\\n")
-		fmt.Fprintf(os.Stderr, "    --access-key AKIA... --secret-key ... --concurrency 32 --chunk-size-mb 128\n\n")
+		fmt.Fprintf(os.Stderr, "  # Download all files under a prefix\n")
+		fmt.Fprintf(os.Stderr, "  gos3 --endpoint https://s3.amazonaws.com --bucket mydata --prefix models/v2/ --output /tmp/models/ --file-concurrency 8\n\n")
+		fmt.Fprintf(os.Stderr, "  # Prefix mode via --key with trailing slash\n")
+		fmt.Fprintf(os.Stderr, "  gos3 --endpoint https://s3.amazonaws.com --bucket mydata --key models/v2/ --output /tmp/models/\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -77,16 +84,13 @@ func main() {
 		var err error
 
 		if profile != "" {
-			// User explicitly requested a profile — use it
 			creds, err = downloader.LoadAWSCredentialsFromProfile(profile)
 			if err != nil {
 				log.Fatalf("could not load credentials for profile %q: %v", profile, err)
 			}
 		} else if envCreds := downloader.LoadAWSCredentialsFromEnv(); envCreds != nil {
-			// Fall back to environment variables
 			creds = envCreds
 		} else {
-			// Fall back to default profile
 			creds, err = downloader.LoadAWSCredentialsFromProfile("default")
 			if err != nil {
 				log.Printf("[warn] no credentials found (no --profile, no env vars, no default profile): %v", err)
@@ -103,10 +107,21 @@ func main() {
 		}
 	}
 
-	// Resolve region: CLI flag > env vars > config file > default
+	// Resolve region
 	if cfg.Region == "" {
 		cfg.Region = downloader.LoadAWSRegion(profile, "us-east-1")
 	}
+
+	// Determine mode: prefix (multi-file) vs single file
+	isPrefixMode := prefix != ""
+	if !isPrefixMode && cfg.Key != "" && strings.HasSuffix(cfg.Key, "/") {
+		isPrefixMode = true
+		prefix = cfg.Key
+		cfg.Key = "" // clear so validation doesn't complain
+	}
+
+	// Strip trailing slash from endpoint
+	cfg.Endpoint = strings.TrimRight(cfg.Endpoint, "/")
 
 	// Validate required flags
 	var missing []string
@@ -116,8 +131,8 @@ func main() {
 	if cfg.Bucket == "" {
 		missing = append(missing, "--bucket")
 	}
-	if cfg.Key == "" {
-		missing = append(missing, "--key")
+	if !isPrefixMode && cfg.Key == "" {
+		missing = append(missing, "--key or --prefix")
 	}
 	if cfg.OutputPath == "" {
 		missing = append(missing, "--output")
@@ -128,10 +143,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Strip trailing slash from endpoint
-	cfg.Endpoint = strings.TrimRight(cfg.Endpoint, "/")
-
-	// Setup context with signal handling for graceful cancellation
+	// Setup context with signal handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -143,79 +155,36 @@ func main() {
 		cancel()
 	}()
 
-	// Execute download
+	if isPrefixMode {
+		runPrefixDownload(ctx, cfg, prefix, fileConcurrency, failFast)
+	} else {
+		runSingleDownload(ctx, cfg)
+	}
+}
+
+// runSingleDownload handles downloading a single file (existing behavior).
+func runSingleDownload(ctx context.Context, cfg *downloader.Config) {
 	log.Printf("Downloading s3://%s/%s → %s", cfg.Bucket, cfg.Key, cfg.OutputPath)
 	log.Printf("  endpoint=%s concurrency=%d chunk_size=%dMB",
 		cfg.Endpoint, cfg.Concurrency, cfg.ChunkSize/(1024*1024))
 
-	// --- Live progress display ---
-	// Track bytes for the speed ticker goroutine
 	var liveBytes int64
 	var totalSize int64
 
 	cfg.OnProgress = func(bytesDownloaded int64) {
 		atomic.StoreInt64(&liveBytes, bytesDownloaded)
 	}
-
 	cfg.OnTotalSize = func(size int64) {
 		atomic.StoreInt64(&totalSize, size)
 	}
 
 	startTime := time.Now()
-
-	// Start live speed ticker — prints current speed every 500ms
 	stopTicker := make(chan struct{})
 	tickerDone := make(chan struct{})
-	go func() {
-		defer close(tickerDone)
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-
-		var prevBytes int64
-		prevTime := startTime
-
-		for {
-			select {
-			case <-stopTicker:
-				// Clear the progress line
-				fmt.Fprintf(os.Stderr, "\r\033[K")
-				return
-			case now := <-ticker.C:
-				currentBytes := atomic.LoadInt64(&liveBytes)
-				elapsed := now.Sub(startTime)
-				dt := now.Sub(prevTime)
-
-				// Instantaneous speed (over last tick interval)
-				var instantMBs float64
-				if dt.Seconds() > 0 {
-					instantMBs = float64(currentBytes-prevBytes) / (1024 * 1024) / dt.Seconds()
-				}
-
-				// Average speed (since start)
-				var avgMBs float64
-				if elapsed.Seconds() > 0 {
-					avgMBs = float64(currentBytes) / (1024 * 1024) / elapsed.Seconds()
-				}
-
-				// Progress percentage
-				ts := atomic.LoadInt64(&totalSize)
-				var pct float64
-				if ts > 0 {
-					pct = float64(currentBytes) / float64(ts) * 100
-				}
-
-				fmt.Fprintf(os.Stderr, "\r  %s / %s (%.1f%%)  speed: %.2f MB/s  avg: %.2f MB/s   ",
-					formatBytes(currentBytes), formatBytes(ts), pct, instantMBs, avgMBs)
-
-				prevBytes = currentBytes
-				prevTime = now
-			}
-		}
-	}()
+	go progressTicker(startTime, &liveBytes, &totalSize, stopTicker, tickerDone)
 
 	result, err := downloader.Download(ctx, cfg)
 
-	// Stop the ticker before printing final output
 	close(stopTicker)
 	<-tickerDone
 
@@ -225,10 +194,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Store totalSize so ticker can show it (already stopped, but for completeness)
-	atomic.StoreInt64(&totalSize, result.TotalBytes)
-
-	// Print final results
 	elapsed := time.Since(startTime)
 	avgMBs := float64(result.TotalBytes) / (1024 * 1024) / elapsed.Seconds()
 	avgGbps := float64(result.TotalBytes) * 8 / (1024 * 1024 * 1024) / elapsed.Seconds()
@@ -248,6 +213,123 @@ func main() {
 		log.Printf("  Checksum:     skipped (multipart ETag)")
 	}
 	log.Printf("  Output:       %s", cfg.OutputPath)
+}
+
+// runPrefixDownload handles downloading all objects under a prefix.
+func runPrefixDownload(ctx context.Context, cfg *downloader.Config, prefix string, fileConcurrency int, failFast bool) {
+	log.Printf("Downloading s3://%s/%s* → %s", cfg.Bucket, prefix, cfg.OutputPath)
+	log.Printf("  endpoint=%s file_concurrency=%d chunk_concurrency=%d chunk_size=%dMB",
+		cfg.Endpoint, fileConcurrency, cfg.Concurrency, cfg.ChunkSize/(1024*1024))
+
+	mcfg := &downloader.MultiConfig{
+		Config:          cfg,
+		Prefix:          prefix,
+		OutputDir:       cfg.OutputPath,
+		FileConcurrency: fileConcurrency,
+		FailFast:        failFast,
+	}
+
+	var liveBytes int64
+	var totalSize int64
+
+	cfg.OnProgress = func(bytesDownloaded int64) {
+		atomic.StoreInt64(&liveBytes, bytesDownloaded)
+	}
+	cfg.OnTotalSize = func(size int64) {
+		atomic.StoreInt64(&totalSize, size)
+	}
+
+	startTime := time.Now()
+	stopTicker := make(chan struct{})
+	tickerDone := make(chan struct{})
+	go progressTicker(startTime, &liveBytes, &totalSize, stopTicker, tickerDone)
+
+	result, err := downloader.DownloadPrefix(ctx, mcfg)
+
+	close(stopTicker)
+	<-tickerDone
+
+	fmt.Fprintf(os.Stderr, "\n")
+
+	if result != nil {
+		elapsed := time.Since(startTime)
+		totalBytes := result.TotalBytes
+		// Include skipped file bytes in total for speed calculation
+		for _, fr := range result.FileResults {
+			if fr.Skipped {
+				totalBytes += fr.Size
+			}
+		}
+
+		avgMBs := float64(totalBytes) / (1024 * 1024) / elapsed.Seconds()
+		avgGbps := float64(totalBytes) * 8 / (1024 * 1024 * 1024) / elapsed.Seconds()
+
+		log.Printf("✓ Prefix download complete!")
+		log.Printf("  Total Files:  %d (%d succeeded, %d skipped, %d failed)",
+			result.TotalFiles, result.SucceededFiles, result.SkippedFiles, result.FailedFiles)
+		log.Printf("  Total Size:   %s", formatBytes(totalBytes))
+		log.Printf("  Duration:     %s", elapsed.Round(time.Millisecond))
+		log.Printf("  Avg Speed:    %.2f MB/s (%.2f Gbps)", avgMBs, avgGbps)
+		log.Printf("  Output:       %s", cfg.OutputPath)
+
+		if result.FailedFiles > 0 {
+			log.Printf("\n  Failed files:")
+			for _, fr := range result.FileResults {
+				if fr.Error != nil {
+					log.Printf("    ✗ %s: %v", fr.Key, fr.Error)
+				}
+			}
+		}
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// progressTicker prints a live progress line every 500ms.
+func progressTicker(startTime time.Time, liveBytes, totalSize *int64, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	var prevBytes int64
+	prevTime := startTime
+
+	for {
+		select {
+		case <-stop:
+			fmt.Fprintf(os.Stderr, "\r\033[K")
+			return
+		case now := <-ticker.C:
+			currentBytes := atomic.LoadInt64(liveBytes)
+			elapsed := now.Sub(startTime)
+			dt := now.Sub(prevTime)
+
+			var instantMBs float64
+			if dt.Seconds() > 0 {
+				instantMBs = float64(currentBytes-prevBytes) / (1024 * 1024) / dt.Seconds()
+			}
+
+			var avgMBs float64
+			if elapsed.Seconds() > 0 {
+				avgMBs = float64(currentBytes) / (1024 * 1024) / elapsed.Seconds()
+			}
+
+			ts := atomic.LoadInt64(totalSize)
+			var pct float64
+			if ts > 0 {
+				pct = float64(currentBytes) / float64(ts) * 100
+			}
+
+			fmt.Fprintf(os.Stderr, "\r  %s / %s (%.1f%%)  speed: %.2f MB/s  avg: %.2f MB/s   ",
+				formatBytes(currentBytes), formatBytes(ts), pct, instantMBs, avgMBs)
+
+			prevBytes = currentBytes
+			prevTime = now
+		}
+	}
 }
 
 func envOrDefault(key, defaultVal string) string {
@@ -271,12 +353,8 @@ func formatBytes(b int64) string {
 }
 
 // setGOMAXPROCS reads the cgroup CPU quota (v1 or v2) to determine how many
-// CPUs are available inside a container. If the quota is lower than
-// runtime.NumCPU(), it sets GOMAXPROCS accordingly. This prevents the Go
-// scheduler from spinning up more OS threads than the cgroup allows,
-// which causes throttling in Kubernetes pods.
+// CPUs are available inside a container.
 func setGOMAXPROCS() {
-	// If user explicitly set GOMAXPROCS env, respect it
 	if os.Getenv("GOMAXPROCS") != "" {
 		return
 	}
@@ -320,5 +398,5 @@ func detectCgroupCPUQuota() int {
 		}
 	}
 
-	return 0 // not in a container or no quota
+	return 0
 }
